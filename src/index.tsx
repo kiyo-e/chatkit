@@ -1,3 +1,7 @@
+/**
+ * Design doc: see README.md ("Architecture Overview") for the service flow and deployment notes.
+ * Related modules: ./client/app.tsx renders the client UI, ./renderer.tsx configures the server-side JSX renderer.
+ */
 import { Hono } from 'hono'
 import { getCookie, setCookie } from 'hono/cookie'
 import App from './client/app'
