@@ -1,0 +1,9 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "chatkit",
+  "compatibility_date": "2025-10-21",
+  "main": "./src/index.tsx",
+  "vars": {
+    "CHATKIT_API_BASE": "https://api.openai.com"
+  }
+}
