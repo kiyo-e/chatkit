@@ -1,16 +1,9 @@
-import { reactRenderer } from '@hono/react-renderer'
 import { Hono } from 'hono'
 import type { Context } from 'hono'
-import { Link, ReactRefresh, Script, ViteClient } from 'vite-ssr-components/react'
+import type { ContentfulStatusCode } from 'hono/utils/http-status'
+import { getCookie, setCookie } from 'hono/cookie'
 import App from './client/app'
-
-type Bindings = {
-  OPENAI_API_KEY: string
-  CHATKIT_WORKFLOW_ID: string
-  CHATKIT_API_BASE?: string
-  OPENAI_ORGANIZATION?: string
-  OPENAI_PROJECT?: string
-}
+import { renderer } from './renderer'
 
 type SessionRequestBody = {
   workflow?: { id?: string | null } | null
@@ -23,49 +16,40 @@ type SessionRequestBody = {
   }
 }
 
-type AppEnv = { Bindings: Bindings }
+type SessionResponsePayload = {
+  client_secret?: string | null
+  expires_after?: number | null
+  error?: { message?: string | null } | string | null
+  message?: string | null
+}
 
 const DEFAULT_CHATKIT_BASE = 'https://api.openai.com'
 const SESSION_COOKIE_NAME = 'chatkit_session_id'
 const SESSION_COOKIE_MAX_AGE = 60 * 60 * 24 * 30 // 30 days
 
-declare module '@hono/react-renderer' {
-  interface Props {
-    title?: string
-  }
-}
-
 // Design Doc: docs/design/vite-ssr-migration.md
 // Related classes: src/client/app.tsx, src/client/index.tsx
+type AppEnv = { Bindings: CloudflareBindings; Variables: { userId: string } }
+
 const app = new Hono<AppEnv>()
 
-app.use(
-  '*',
-  reactRenderer(({ children, title }) => {
-    const Refresh = import.meta.env.DEV ? ReactRefresh : () => null
-    return (
-      <html>
-        <head>
-          {title && <title>{title}</title>}
-          <Refresh />
-          <ViteClient />
-          <script src="https://cdn.platform.openai.com/deployments/chatkit/chatkit.js" defer />
-          <Script src="/src/client/index.tsx" />
-          <Link href="/src/style.css" rel="stylesheet" />
-        </head>
-        <body>
-          <div className="page-layout">
-            <div id="root">{children}</div>
-          </div>
-        </body>
-      </html>
-    )
-  })
-)
+app.use('*', renderer)
 
-app.get('/', (c) => {
-  return c.render(<App />, { title: 'ChatKit Demo' })
+app.use('/api/*', async (c, next) => {
+  const userId = resolveUser(c)
+  c.set('userId', userId)
+  await next()
 })
+
+app.onError((err, c) => {
+  console.error('Unhandled application error', err)
+  if (c.req.path.startsWith('/api/')) {
+    return c.json({ error: 'Internal Server Error' }, 500)
+  }
+  return c.text('Internal Server Error', 500)
+})
+
+app.get('/', (c) => c.render(<App />))
 
 app.post('/api/chatkit/session', async (c) => {
   const env = c.env
@@ -73,49 +57,38 @@ app.post('/api/chatkit/session', async (c) => {
     return c.json({ error: 'Missing OPENAI_API_KEY' }, 500)
   }
 
-  const requestBody = (await parseJson<SessionRequestBody>(c).catch(() => null)) ?? {}
+  const requestBody = await c.req.json<SessionRequestBody>().catch(() => null)
   const resolvedWorkflowId =
-    requestBody.workflow?.id ?? requestBody.workflowId ?? env.CHATKIT_WORKFLOW_ID
+    requestBody?.workflow?.id ?? requestBody?.workflowId ?? env.CHATKIT_WORKFLOW_ID
 
   if (!resolvedWorkflowId) {
     return c.json({ error: 'Missing CHATKIT_WORKFLOW_ID configuration' }, 400)
   }
 
-  const { userId, cookie } = resolveUser(c)
+  const userId = c.get('userId')
   const apiBase = env.CHATKIT_API_BASE ?? DEFAULT_CHATKIT_BASE
-
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${env.OPENAI_API_KEY}`,
-    'OpenAI-Beta': 'chatkit_beta=v1'
-  }
-
-  if (env.OPENAI_ORGANIZATION) {
-    headers['OpenAI-Organization'] = env.OPENAI_ORGANIZATION
-  }
-  if (env.OPENAI_PROJECT) {
-    headers['OpenAI-Project'] = env.OPENAI_PROJECT
-  }
 
   const upstreamResponse = await fetch(`${apiBase}/v1/chatkit/sessions`, {
     method: 'POST',
-    headers,
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${env.OPENAI_API_KEY}`,
+      'OpenAI-Beta': 'chatkit_beta=v1',
+      ...(env.OPENAI_ORGANIZATION ? { 'OpenAI-Organization': env.OPENAI_ORGANIZATION } : {}),
+      ...(env.OPENAI_PROJECT ? { 'OpenAI-Project': env.OPENAI_PROJECT } : {})
+    },
     body: JSON.stringify({
       workflow: { id: resolvedWorkflowId },
-      user: requestBody.user ?? userId,
+      user: requestBody?.user ?? userId,
       chatkit_configuration: {
         file_upload: {
-          enabled: requestBody.chatkit_configuration?.file_upload?.enabled ?? false
+          enabled: requestBody?.chatkit_configuration?.file_upload?.enabled ?? false
         }
       }
     })
   })
 
-  const payload = (await upstreamResponse.json().catch(() => ({}))) as Record<string, unknown>
-
-  if (cookie) {
-    c.header('Set-Cookie', cookie)
-  }
+  const payload = (await upstreamResponse.json().catch(() => ({}))) as SessionResponsePayload
 
   if (!upstreamResponse.ok) {
     const message = resolveUpstreamError(payload)
@@ -124,92 +97,70 @@ app.post('/api/chatkit/session', async (c) => {
         error: message ?? 'Failed to create ChatKit session',
         details: payload
       },
-      upstreamResponse.status
+      toContentfulStatus(upstreamResponse.status)
     )
   }
 
   return c.json({
-    client_secret: payload?.client_secret ?? null,
-    expires_after: payload?.expires_after ?? null
+    client_secret: extractString(payload?.client_secret),
+    expires_after: typeof payload?.expires_after === 'number' ? payload.expires_after : null
   })
 })
 
 export default app
 
-async function parseJson<T>(c: Context<AppEnv>): Promise<T | null> {
-  try {
-    return await c.req.json<T>()
-  } catch {
-    return null
-  }
-}
-
-function resolveUser(c: Context<AppEnv>): { userId: string; cookie: string | null } {
-  const cookieHeader = c.req.header('Cookie')
-  const existing = getCookieValue(cookieHeader, SESSION_COOKIE_NAME)
+function resolveUser(c: Context<AppEnv>): string {
+  const existing = getCookie(c, SESSION_COOKIE_NAME)
   if (existing) {
-    return { userId: existing, cookie: null }
+    return existing
   }
 
   const generated = typeof crypto.randomUUID === 'function' ? crypto.randomUUID() : cryptoIdFallback()
   const secure = import.meta.env.PROD
-  return {
-    userId: generated,
-    cookie: serializeCookie(SESSION_COOKIE_NAME, generated, secure)
-  }
-}
 
-function getCookieValue(cookieHeader: string | undefined | null, name: string): string | null {
-  if (!cookieHeader) {
-    return null
-  }
-  const cookies = cookieHeader.split(';')
-  for (const cookie of cookies) {
-    const [rawName, ...rest] = cookie.split('=')
-    if (!rawName || rest.length === 0) continue
-    if (rawName.trim() === name) {
-      return rest.join('=').trim()
-    }
-  }
-  return null
-}
+  setCookie(c, SESSION_COOKIE_NAME, generated, {
+    path: '/',
+    maxAge: SESSION_COOKIE_MAX_AGE,
+    httpOnly: true,
+    sameSite: 'Lax',
+    secure
+  })
 
-function serializeCookie(name: string, value: string, secure: boolean): string {
-  const attributes = [
-    `${name}=${encodeURIComponent(value)}`,
-    'Path=/',
-    `Max-Age=${SESSION_COOKIE_MAX_AGE}`,
-    'HttpOnly',
-    'SameSite=Lax'
-  ]
-  if (secure) {
-    attributes.push('Secure')
-  }
-  return attributes.join('; ')
+  return generated
 }
 
 function cryptoIdFallback(): string {
   return Math.random().toString(36).slice(2)
 }
 
-function resolveUpstreamError(payload: Record<string, unknown>): string | null {
+function resolveUpstreamError(payload: SessionResponsePayload | null): string | null {
   if (!payload) {
     return null
   }
+
   const error = payload.error
-  if (typeof error === 'string') {
-    return error
+  if (typeof error === 'string') return error
+
+  if (error && typeof error === 'object') {
+    const message = (error as { message?: unknown }).message
+    if (typeof message === 'string') {
+      return message
+    }
   }
-  if (
-    error &&
-    typeof error === 'object' &&
-    'message' in error &&
-    typeof (error as { message?: unknown }).message === 'string'
-  ) {
-    return (error as { message: string }).message
+
+  return extractString(payload.message)
+}
+
+function extractString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null
+}
+
+function toContentfulStatus(status: number): ContentfulStatusCode {
+  if (status === 101 || status === 204 || status === 205 || status === 304) {
+    return 500
   }
-  if (typeof payload.message === 'string') {
-    return payload.message
+  if (status < 200 || status > 599) {
+    return 500
   }
-  return null
+  return status as ContentfulStatusCode
 }
