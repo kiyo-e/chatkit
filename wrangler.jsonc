@@ -1,6 +1,6 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "chatkit",
+  "name": "openai-chatkit-on-hono",
   "compatibility_date": "2025-10-21",
   "main": "./src/index.tsx",
   "vars": {
